@@ -1,4 +1,4 @@
-# Query SQL per l'analisi forense di Foto iOS e WhatsApp
+# Query SQL per Digital Forensic Examiners
 
 Raccolta di query SQLite commentate per l'analisi forense di database di dispositivi mobili, con particolare attenzione a **contenuti eliminati**, **cestinamenti** e **salti di ID**.
 
