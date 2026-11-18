@@ -1,0 +1,606 @@
+================================================================================
+ QUERY DI ANALISI FORENSE - WhatsApp Android - msgstore.db
+ Messaggi, chat, media, chiamate, messaggi eliminati e salti di ID
+================================================================================
+
+NOTE GENERALI
+- Percorso tipico: /data/data/com.whatsapp/databases/msgstore.db
+  (il file si chiama msgstore.db; i backup cifrati sono msgstore.db.crypt14/15
+  e vanno prima decifrati). I nomi dei contatti in rubrica sono in wa.db,
+  nella stessa cartella. Analizzare sempre una copia insieme ai file -wal
+  e -shm.
+- Le query si riferiscono allo schema "nuovo" (tabelle message, chat, jid,
+  message_media, ecc.), in uso dalle versioni del 2022 circa. I database
+  piu' vecchi usano la tabella "messages" (key_remote_jid, data, ...) e
+  richiedono query diverse. Verificare lo schema con la sezione 1.
+- I timestamp sono in Unix time in MILLISECONDI: si divide per 1000 e si usa
+  'unixepoch'. Gli orari risultanti sono in UTC; per l'ora italiana
+  aggiungere '+2 hours' (CEST) o '+1 hours' (CET).
+- I codici di message_type indicati sono quelli piu' comunemente
+  documentati e vanno confermati sul dataset in esame.
+- La tabella message usa AUTOINCREMENT: l'ultimo _id assegnato e' registrato
+  in sqlite_sequence anche se i messaggi piu' recenti sono stati eliminati.
+- I salti di _id NON provano da soli un'eliminazione manuale da parte
+  dell'utente. Possono derivare anche da: aggiornamenti di stato scaduti
+  (status@broadcast, 24 ore), messaggi effimeri, svuotamento o eliminazione
+  di una chat, ripristino da backup, record tecnici rimossi dall'app. Vanno
+  sempre contestualizzati (sezione 4).
+- Gli intervalli di date nelle query sono di esempio (26-28/05/2026): il
+  limite superiore e' esclusivo.
+
+
+================================================================================
+ SEZIONE 1 - VERIFICHE PRELIMINARI
+================================================================================
+
+-- 1.1 Elenca tutte le tabelle del database, per verificare lo schema
+--     (nuovo: message/chat/jid; vecchio: messages) e la presenza di tabelle
+--     come message_revoked, message_edit_info, message_ephemeral.
+SELECT name FROM sqlite_master WHERE type = 'table' ORDER BY name;
+
+
+-- 1.2 Elenca le colonne delle tabelle principali.
+PRAGMA table_info(message);
+PRAGMA table_info(chat);
+PRAGMA table_info(jid);
+PRAGMA table_info(message_media);
+
+
+-- 1.3 Mostra l'ultimo valore assegnato dai contatori AUTOINCREMENT per ogni
+--     tabella (message, chat, call_log, ecc.).
+SELECT name, seq FROM sqlite_sequence ORDER BY name;
+
+
+-- 1.4 Conta i messaggi per tipo (message_type). Codici frequenti, da
+--     verificare: 0 testo, 1 immagine, 2 audio/vocale, 3 video, 4 contatto,
+--     5 posizione, 7 messaggio di sistema, 9 documento, 13 GIF,
+--     15 messaggio eliminato ("Questo messaggio e' stato eliminato"),
+--     16 posizione in tempo reale, 20 sticker, 42/43 immagine/video
+--     visualizzabile una volta.
+SELECT message_type, count(*) AS n_messaggi
+FROM message
+GROUP BY message_type
+ORDER BY n_messaggi DESC;
+
+
+-- 1.5 Indica l'intervallo temporale e di _id coperto dai messaggi presenti.
+SELECT count(*)                                            AS n_messaggi,
+       min(_id)                                            AS id_min,
+       max(_id)                                            AS id_max,
+       datetime(min(timestamp) / 1000, 'unixepoch')        AS primo_messaggio_utc,
+       datetime(max(timestamp) / 1000, 'unixepoch')        AS ultimo_messaggio_utc
+FROM message
+WHERE timestamp > 0;
+
+
+-- 1.6 (Opzionale) Collega wa.db per ottenere i nomi della rubrica.
+--     Adattare il percorso. Dopo l'ATTACH le query possono usare
+--     wa.wa_contacts (jid, display_name, number).
+-- ATTACH DATABASE 'C:\percorso\wa.db' AS wa;
+
+
+================================================================================
+ SEZIONE 2 - CHAT E MESSAGGI
+================================================================================
+
+-- 2.1 Elenca le chat con JID, nome del gruppo (subject), data di
+--     creazione, ultimo messaggio, numero di messaggi presenti e stato
+--     (archiviata/nascosta).
+SELECT c._id,
+       j.raw_string                                         AS jid_chat,
+       c.subject                                            AS nome_gruppo,
+       datetime(c.created_timestamp / 1000, 'unixepoch')    AS creata_utc,
+       datetime(c.sort_timestamp / 1000, 'unixepoch')       AS ultima_attivita_utc,
+       (SELECT count(*) FROM message m WHERE m.chat_row_id = c._id) AS n_messaggi_presenti,
+       c.archived,
+       c.hidden
+FROM chat c
+LEFT JOIN jid j ON j._id = c.jid_row_id
+ORDER BY c.sort_timestamp DESC;
+
+
+-- 2.2 Elenca tutti i messaggi con chat, mittente, direzione, tipo, testo e
+--     date (invio, ricezione). Per i gruppi riporta il membro mittente
+--     (sender_jid_row_id).
+SELECT m._id,
+       jc.raw_string                                         AS jid_chat,
+       c.subject                                             AS nome_gruppo,
+       CASE m.from_me WHEN 1 THEN 'inviato' ELSE 'ricevuto' END AS direzione,
+       js.raw_string                                         AS mittente_gruppo,
+       m.message_type,
+       m.text_data,
+       datetime(m.timestamp / 1000, 'unixepoch')             AS data_utc,
+       datetime(m.received_timestamp / 1000, 'unixepoch')    AS ricevuto_utc,
+       m.status,
+       m.key_id,
+       m.sort_id
+FROM message m
+LEFT JOIN chat c ON c._id = m.chat_row_id
+LEFT JOIN jid jc ON jc._id = c.jid_row_id
+LEFT JOIN jid js ON js._id = m.sender_jid_row_id
+ORDER BY m.timestamp;
+
+
+-- 2.3 Messaggi di un intervallo di date, ordinati per data.
+SELECT m._id,
+       jc.raw_string AS jid_chat,
+       c.subject     AS nome_gruppo,
+       CASE m.from_me WHEN 1 THEN 'inviato' ELSE 'ricevuto' END AS direzione,
+       js.raw_string AS mittente_gruppo,
+       m.message_type,
+       m.text_data,
+       datetime(m.timestamp / 1000, 'unixepoch') AS data_utc
+FROM message m
+LEFT JOIN chat c ON c._id = m.chat_row_id
+LEFT JOIN jid jc ON jc._id = c.jid_row_id
+LEFT JOIN jid js ON js._id = m.sender_jid_row_id
+WHERE m.timestamp >= strftime('%s', '2026-05-26 00:00:00') * 1000
+  AND m.timestamp <  strftime('%s', '2026-05-29 00:00:00') * 1000
+ORDER BY m.timestamp;
+
+
+-- 2.4 Conta i messaggi inviati e ricevuti per chat e per giorno, per
+--     individuare picchi o giornate anomale.
+SELECT COALESCE(c.subject, jc.raw_string) AS chat,
+       date(m.timestamp / 1000, 'unixepoch') AS giorno_utc,
+       sum(CASE WHEN m.from_me = 1 THEN 1 ELSE 0 END) AS inviati,
+       sum(CASE WHEN m.from_me = 0 THEN 1 ELSE 0 END) AS ricevuti
+FROM message m
+LEFT JOIN chat c ON c._id = m.chat_row_id
+LEFT JOIN jid jc ON jc._id = c.jid_row_id
+WHERE m.timestamp > 0
+GROUP BY 1, 2
+ORDER BY 2, 1;
+
+
+================================================================================
+ SEZIONE 3 - MESSAGGI ELIMINATI "PER TUTTI" (REVOCATI) E MODIFICATI
+================================================================================
+
+-- 3.1 Elenca i messaggi eliminati per tutti (message_type = 15, da
+--     verificare). Il record resta nel database ma il contenuto originale
+--     viene rimosso: restano chat, mittente, direzione e date.
+SELECT m._id,
+       COALESCE(c.subject, jc.raw_string)                   AS chat,
+       CASE m.from_me WHEN 1 THEN 'inviato' ELSE 'ricevuto' END AS direzione,
+       js.raw_string                                        AS mittente_gruppo,
+       datetime(m.timestamp / 1000, 'unixepoch')            AS data_utc,
+       m.key_id,
+       m.text_data
+FROM message m
+LEFT JOIN chat c ON c._id = m.chat_row_id
+LEFT JOIN jid jc ON jc._id = c.jid_row_id
+LEFT JOIN jid js ON js._id = m.sender_jid_row_id
+WHERE m.message_type = 15
+ORDER BY m.timestamp;
+
+
+-- 3.2 Dettaglio delle revoche dalla tabella message_revoked (se presente):
+--     data e ora della revoca, eventuale amministratore del gruppo che ha
+--     eliminato il messaggio altrui e key_id del messaggio revocato.
+SELECT r.message_row_id,
+       COALESCE(c.subject, jc.raw_string)                   AS chat,
+       datetime(m.timestamp / 1000, 'unixepoch')            AS data_messaggio_utc,
+       datetime(r.revoke_timestamp / 1000, 'unixepoch')     AS data_revoca_utc,
+       r.revoked_key_id,
+       ja.raw_string                                        AS admin_che_ha_revocato
+FROM message_revoked r
+LEFT JOIN message m ON m._id = r.message_row_id
+LEFT JOIN chat c    ON c._id = m.chat_row_id
+LEFT JOIN jid jc    ON jc._id = c.jid_row_id
+LEFT JOIN jid ja    ON ja._id = r.admin_jid_row_id
+ORDER BY r.revoke_timestamp;
+
+
+-- 3.3 Conta i messaggi eliminati per tutti per chat e direzione.
+SELECT COALESCE(c.subject, jc.raw_string) AS chat,
+       CASE m.from_me WHEN 1 THEN 'inviato' ELSE 'ricevuto' END AS direzione,
+       count(*) AS n_eliminati,
+       datetime(min(m.timestamp) / 1000, 'unixepoch') AS primo_utc,
+       datetime(max(m.timestamp) / 1000, 'unixepoch') AS ultimo_utc
+FROM message m
+LEFT JOIN chat c ON c._id = m.chat_row_id
+LEFT JOIN jid jc ON jc._id = c.jid_row_id
+WHERE m.message_type = 15
+GROUP BY 1, 2
+ORDER BY n_eliminati DESC;
+
+
+-- 3.4 Per ogni messaggio eliminato per tutti, mostra il messaggio
+--     precedente e quello successivo nella stessa chat, per ricostruire il
+--     contesto. Richiede SQLite 3.25+ (funzioni finestra).
+SELECT * FROM (
+  SELECT m._id,
+         COALESCE(c.subject, jc.raw_string) AS chat,
+         m.message_type,
+         datetime(m.timestamp / 1000, 'unixepoch') AS data_utc,
+         LAG(m.text_data)  OVER (PARTITION BY m.chat_row_id ORDER BY m.sort_id, m._id) AS testo_precedente,
+         LEAD(m.text_data) OVER (PARTITION BY m.chat_row_id ORDER BY m.sort_id, m._id) AS testo_successivo
+  FROM message m
+  LEFT JOIN chat c ON c._id = m.chat_row_id
+  LEFT JOIN jid jc ON jc._id = c.jid_row_id
+)
+WHERE message_type = 15
+ORDER BY data_utc;
+
+
+-- 3.5 Messaggi modificati (tabella message_edit_info, se presente): data
+--     della modifica. Il testo nel campo text_data e' quello finale.
+SELECT e.message_row_id,
+       COALESCE(c.subject, jc.raw_string)               AS chat,
+       datetime(m.timestamp / 1000, 'unixepoch')        AS data_originale_utc,
+       datetime(e.edited_timestamp / 1000, 'unixepoch') AS data_modifica_utc,
+       m.text_data                                      AS testo_attuale
+FROM message_edit_info e
+LEFT JOIN message m ON m._id = e.message_row_id
+LEFT JOIN chat c    ON c._id = m.chat_row_id
+LEFT JOIN jid jc    ON jc._id = c.jid_row_id
+ORDER BY e.edited_timestamp;
+
+
+================================================================================
+ SEZIONE 4 - SALTI DI ID (MESSAGGI RIMOSSI DAL DATABASE)
+================================================================================
+
+-- 4.1 Confronta il numero di messaggi presenti con l'ultimo _id assegnato
+--     (sqlite_sequence). La differenza e' il numero di record di messaggio
+--     non piu' presenti. Se seq e' maggiore di max(_id), sono stati
+--     eliminati anche i messaggi piu' recenti.
+SELECT (SELECT seq FROM sqlite_sequence WHERE name = 'message')   AS ultimo_id_assegnato,
+       (SELECT max(_id) FROM message)                             AS max_id_presente,
+       (SELECT count(*) FROM message)                             AS messaggi_presenti,
+       (SELECT seq FROM sqlite_sequence WHERE name = 'message')
+         - (SELECT count(*) FROM message)                         AS record_mancanti;
+
+
+-- 4.2 Individua i salti nella sequenza _id della tabella message, con il
+--     numero di record mancanti per ciascun salto.
+SELECT _id + 1              AS primo_id_mancante,
+       prossimo - 1         AS ultimo_id_mancante,
+       prossimo - _id - 1   AS n_mancanti
+FROM (SELECT _id, LEAD(_id) OVER (ORDER BY _id) AS prossimo FROM message)
+WHERE prossimo - _id > 1
+ORDER BY _id;
+
+
+-- 4.3 Per ogni salto di _id, mostra il messaggio immediatamente prima e
+--     quello immediatamente dopo (chat, data, testo). Le date dei due
+--     messaggi delimitano l'intervallo in cui i record mancanti sono stati
+--     creati e le chat indicano dove cercare. L'_id riflette l'ordine di
+--     inserimento nel database, che di norma segue l'ordine cronologico ma
+--     non coincide necessariamente con la data del messaggio (es. messaggi
+--     ricevuti in ritardo).
+WITH seq AS (
+  SELECT m._id, m.chat_row_id, m.timestamp, m.text_data,
+         LEAD(m._id)         OVER (ORDER BY m._id) AS id_succ,
+         LEAD(m.chat_row_id) OVER (ORDER BY m._id) AS chat_succ,
+         LEAD(m.timestamp)   OVER (ORDER BY m._id) AS data_succ,
+         LEAD(m.text_data)   OVER (ORDER BY m._id) AS testo_succ
+  FROM message m
+)
+SELECT seq._id                                        AS id_prima,
+       seq.id_succ                                    AS id_dopo,
+       seq.id_succ - seq._id - 1                      AS n_mancanti,
+       COALESCE(c1.subject, j1.raw_string)            AS chat_prima,
+       datetime(seq.timestamp / 1000, 'unixepoch')    AS data_prima_utc,
+       seq.text_data                                  AS testo_prima,
+       COALESCE(c2.subject, j2.raw_string)            AS chat_dopo,
+       datetime(seq.data_succ / 1000, 'unixepoch')    AS data_dopo_utc,
+       seq.testo_succ                                 AS testo_dopo
+FROM seq
+LEFT JOIN chat c1 ON c1._id = seq.chat_row_id
+LEFT JOIN jid  j1 ON j1._id = c1.jid_row_id
+LEFT JOIN chat c2 ON c2._id = seq.chat_succ
+LEFT JOIN jid  j2 ON j2._id = c2.jid_row_id
+WHERE seq.id_succ - seq._id > 1
+ORDER BY seq._id;
+
+
+-- 4.4 Come la 4.3, ma limitata ai salti i cui messaggi adiacenti cadono
+--     nell'intervallo di date di interesse.
+WITH seq AS (
+  SELECT m._id, m.chat_row_id, m.timestamp,
+         LEAD(m._id)         OVER (ORDER BY m._id) AS id_succ,
+         LEAD(m.chat_row_id) OVER (ORDER BY m._id) AS chat_succ,
+         LEAD(m.timestamp)   OVER (ORDER BY m._id) AS data_succ
+  FROM message m
+)
+SELECT seq._id AS id_prima, seq.id_succ AS id_dopo,
+       seq.id_succ - seq._id - 1 AS n_mancanti,
+       COALESCE(c1.subject, j1.raw_string) AS chat_prima,
+       datetime(seq.timestamp / 1000, 'unixepoch') AS data_prima_utc,
+       COALESCE(c2.subject, j2.raw_string) AS chat_dopo,
+       datetime(seq.data_succ / 1000, 'unixepoch') AS data_dopo_utc
+FROM seq
+LEFT JOIN chat c1 ON c1._id = seq.chat_row_id
+LEFT JOIN jid  j1 ON j1._id = c1.jid_row_id
+LEFT JOIN chat c2 ON c2._id = seq.chat_succ
+LEFT JOIN jid  j2 ON j2._id = c2.jid_row_id
+WHERE seq.id_succ - seq._id > 1
+  AND seq.timestamp >= strftime('%s', '2026-05-26 00:00:00') * 1000
+  AND seq.data_succ <  strftime('%s', '2026-05-29 00:00:00') * 1000
+ORDER BY seq._id;
+
+
+-- 4.5 Riepiloga i salti di _id per giorno (in base alla data del messaggio
+--     che precede il salto), per individuare le giornate con piu' record
+--     rimossi.
+WITH seq AS (
+  SELECT _id, timestamp, LEAD(_id) OVER (ORDER BY _id) AS id_succ
+  FROM message
+)
+SELECT date(timestamp / 1000, 'unixepoch') AS giorno_utc,
+       count(*)                            AS n_salti,
+       sum(id_succ - _id - 1)              AS tot_mancanti
+FROM seq
+WHERE id_succ - _id > 1
+GROUP BY 1
+ORDER BY tot_mancanti DESC;
+
+
+-- 4.6 Chat il cui ultimo messaggio registrato (last_message_row_id) o
+--     messaggio visualizzato in elenco (display_message_row_id) non esiste
+--     piu' nella tabella message: indicano l'eliminazione dei messaggi piu'
+--     recenti di quella conversazione.
+SELECT c._id,
+       COALESCE(c.subject, j.raw_string)                AS chat,
+       c.last_message_row_id,
+       c.display_message_row_id,
+       datetime(c.sort_timestamp / 1000, 'unixepoch')   AS ultima_attivita_utc,
+       (SELECT max(_id) FROM message m WHERE m.chat_row_id = c._id) AS max_id_presente_chat
+FROM chat c
+LEFT JOIN jid j ON j._id = c.jid_row_id
+WHERE (c.last_message_row_id    IS NOT NULL AND c.last_message_row_id    > 0
+       AND c.last_message_row_id    NOT IN (SELECT _id FROM message))
+   OR (c.display_message_row_id IS NOT NULL AND c.display_message_row_id > 0
+       AND c.display_message_row_id NOT IN (SELECT _id FROM message));
+
+
+-- 4.7 Salti nella sequenza _id delle chat: indicano chat eliminate.
+SELECT _id + 1 AS primo_id_mancante,
+       prossimo - 1 AS ultimo_id_mancante,
+       prossimo - _id - 1 AS n_mancanti
+FROM (SELECT _id, LEAD(_id) OVER (ORDER BY _id) AS prossimo FROM chat)
+WHERE prossimo - _id > 1
+ORDER BY _id;
+
+
+-- 4.8 Messaggi "orfani": messaggi che puntano a una chat non piu' presente.
+SELECT m._id, m.chat_row_id, m.text_data,
+       datetime(m.timestamp / 1000, 'unixepoch') AS data_utc
+FROM message m
+LEFT JOIN chat c ON c._id = m.chat_row_id
+WHERE m.chat_row_id > 0 AND c._id IS NULL
+ORDER BY m.timestamp;
+
+
+-- 4.9 Record "orfani" nelle tabelle collegate (media, posizioni, vCard):
+--     puntano a messaggi non piu' presenti e possono conservare percorso
+--     del file, nome, didascalia, coordinate o contatti di un messaggio
+--     eliminato.
+SELECT 'media' AS tabella, mm.message_row_id, mm.file_path AS dato1,
+       mm.media_name AS dato2, mm.media_caption AS dato3
+FROM message_media mm
+LEFT JOIN message m ON m._id = mm.message_row_id
+WHERE m._id IS NULL
+UNION ALL
+SELECT 'location', ml.message_row_id, ml.latitude, ml.longitude, ml.place_name
+FROM message_location ml
+LEFT JOIN message m ON m._id = ml.message_row_id
+WHERE m._id IS NULL
+UNION ALL
+SELECT 'vcard', mv.message_row_id, mv.vcard, NULL, NULL
+FROM message_vcard mv
+LEFT JOIN message m ON m._id = mv.message_row_id
+WHERE m._id IS NULL;
+
+
+-- 4.10 Aggiornamenti di stato presenti (chat status@broadcast). Gli stati
+--      scadono dopo 24 ore e vengono rimossi: sono una causa frequente di
+--      salti di _id da escludere prima di ipotizzare eliminazioni manuali.
+SELECT m._id,
+       CASE m.from_me WHEN 1 THEN 'proprio' ELSE 'di altri' END AS origine,
+       js.raw_string AS autore,
+       m.message_type, m.text_data,
+       datetime(m.timestamp / 1000, 'unixepoch') AS data_utc
+FROM message m
+JOIN chat c ON c._id = m.chat_row_id
+JOIN jid jc ON jc._id = c.jid_row_id AND jc.raw_string = 'status@broadcast'
+LEFT JOIN jid js ON js._id = m.sender_jid_row_id
+ORDER BY m.timestamp;
+
+
+-- 4.11 Messaggi effimeri (tabella message_ephemeral, se presente): durata
+--      impostata e scadenza prevista. Spiega la successiva scomparsa di
+--      messaggi nelle chat con messaggi temporanei attivi.
+SELECT e.message_row_id,
+       COALESCE(c.subject, jc.raw_string)              AS chat,
+       datetime(m.timestamp / 1000, 'unixepoch')       AS data_utc,
+       e.duration                                      AS durata_secondi,
+       datetime(e.expire_timestamp / 1000, 'unixepoch') AS scadenza_utc
+FROM message_ephemeral e
+LEFT JOIN message m ON m._id = e.message_row_id
+LEFT JOIN chat c    ON c._id = m.chat_row_id
+LEFT JOIN jid jc    ON jc._id = c.jid_row_id
+ORDER BY m.timestamp;
+
+
+================================================================================
+ SEZIONE 5 - MEDIA, POSIZIONI E CONTATTI
+================================================================================
+
+-- 5.1 Elenca i messaggi con allegati: percorso locale, tipo MIME,
+--     dimensione, nome, didascalia, hash del file e URL.
+SELECT m._id,
+       COALESCE(c.subject, jc.raw_string) AS chat,
+       CASE m.from_me WHEN 1 THEN 'inviato' ELSE 'ricevuto' END AS direzione,
+       datetime(m.timestamp / 1000, 'unixepoch') AS data_utc,
+       mm.file_path, mm.mime_type, mm.file_size, mm.media_name,
+       mm.media_caption, mm.file_hash, mm.message_url
+FROM message_media mm
+JOIN message m   ON m._id = mm.message_row_id
+LEFT JOIN chat c ON c._id = m.chat_row_id
+LEFT JOIN jid jc ON jc._id = c.jid_row_id
+ORDER BY m.timestamp;
+
+
+-- 5.2 Estrae l'elenco dei percorsi dei media referenziati, da confrontare
+--     con il contenuto della cartella WhatsApp/Media (o Android/media/
+--     com.whatsapp/WhatsApp/Media). L'hash (file_hash, Base64 SHA-256) puo'
+--     essere usato per ritrovare i file anche se rinominati.
+SELECT DISTINCT mm.file_path, mm.file_hash
+FROM message_media mm
+WHERE mm.file_path IS NOT NULL
+ORDER BY 1;
+
+
+-- 5.3 Posizioni condivise, con coordinate, nome e indirizzo del luogo.
+SELECT m._id,
+       COALESCE(c.subject, jc.raw_string) AS chat,
+       CASE m.from_me WHEN 1 THEN 'inviato' ELSE 'ricevuto' END AS direzione,
+       datetime(m.timestamp / 1000, 'unixepoch') AS data_utc,
+       ml.latitude, ml.longitude, ml.place_name, ml.place_address
+FROM message_location ml
+JOIN message m   ON m._id = ml.message_row_id
+LEFT JOIN chat c ON c._id = m.chat_row_id
+LEFT JOIN jid jc ON jc._id = c.jid_row_id
+ORDER BY m.timestamp;
+
+
+-- 5.4 Contatti condivisi (vCard).
+SELECT m._id,
+       COALESCE(c.subject, jc.raw_string) AS chat,
+       datetime(m.timestamp / 1000, 'unixepoch') AS data_utc,
+       mv.vcard
+FROM message_vcard mv
+JOIN message m   ON m._id = mv.message_row_id
+LEFT JOIN chat c ON c._id = m.chat_row_id
+LEFT JOIN jid jc ON jc._id = c.jid_row_id
+ORDER BY m.timestamp;
+
+
+================================================================================
+ SEZIONE 6 - CHIAMATE
+================================================================================
+
+-- 6.1 Registro chiamate WhatsApp: interlocutore, direzione, tipo
+--     (audio/video), durata ed esito.
+SELECT cl._id,
+       j.raw_string                                     AS interlocutore,
+       CASE cl.from_me WHEN 1 THEN 'effettuata' ELSE 'ricevuta' END AS direzione,
+       CASE cl.video_call WHEN 1 THEN 'video' ELSE 'audio' END      AS tipo,
+       datetime(cl.timestamp / 1000, 'unixepoch')       AS data_utc,
+       cl.duration                                      AS durata_secondi,
+       cl.call_result                                   AS esito
+FROM call_log cl
+LEFT JOIN jid j ON j._id = cl.jid_row_id
+ORDER BY cl.timestamp;
+
+
+-- 6.2 Salti nella sequenza _id del registro chiamate: indicano chiamate
+--     eliminate dal registro.
+SELECT _id + 1 AS primo_id_mancante,
+       prossimo - 1 AS ultimo_id_mancante,
+       prossimo - _id - 1 AS n_mancanti
+FROM (SELECT _id, LEAD(_id) OVER (ORDER BY _id) AS prossimo FROM call_log)
+WHERE prossimo - _id > 1
+ORDER BY _id;
+
+
+================================================================================
+ SEZIONE 7 - ALTRE VERIFICHE
+================================================================================
+
+-- 7.1 Messaggi di sistema (message_type = 7) con codice dell'azione
+--     (message_system.action_type): ingressi/uscite dai gruppi, cambi di
+--     nome, cambio numero, attivazione dei messaggi effimeri, ecc.
+SELECT m._id,
+       COALESCE(c.subject, jc.raw_string) AS chat,
+       datetime(m.timestamp / 1000, 'unixepoch') AS data_utc,
+       ms.action_type,
+       js.raw_string AS soggetto
+FROM message m
+LEFT JOIN message_system ms ON ms.message_row_id = m._id
+LEFT JOIN chat c ON c._id = m.chat_row_id
+LEFT JOIN jid jc ON jc._id = c.jid_row_id
+LEFT JOIN jid js ON js._id = m.sender_jid_row_id
+WHERE m.message_type = 7
+ORDER BY m.timestamp;
+
+
+-- 7.2 Messaggi importanti (stellati).
+SELECT m._id, COALESCE(c.subject, jc.raw_string) AS chat, m.text_data,
+       datetime(m.timestamp / 1000, 'unixepoch') AS data_utc
+FROM message m
+LEFT JOIN chat c ON c._id = m.chat_row_id
+LEFT JOIN jid jc ON jc._id = c.jid_row_id
+WHERE m.starred = 1
+ORDER BY m.timestamp;
+
+
+-- 7.3 Ricerca per parola chiave nel testo dei messaggi e nelle didascalie
+--     dei media (sostituire 'parola' con il termine di interesse).
+SELECT m._id, COALESCE(c.subject, jc.raw_string) AS chat,
+       CASE m.from_me WHEN 1 THEN 'inviato' ELSE 'ricevuto' END AS direzione,
+       m.text_data, mm.media_caption,
+       datetime(m.timestamp / 1000, 'unixepoch') AS data_utc
+FROM message m
+LEFT JOIN message_media mm ON mm.message_row_id = m._id
+LEFT JOIN chat c ON c._id = m.chat_row_id
+LEFT JOIN jid jc ON jc._id = c.jid_row_id
+WHERE m.text_data LIKE '%parola%' OR mm.media_caption LIKE '%parola%'
+ORDER BY m.timestamp;
+
+
+-- 7.4 Incongruenze temporali: messaggi ricevuti con differenza superiore a
+--     1 ora tra il timestamp del mittente e quello di ricezione sul
+--     dispositivo (dispositivo offline, consegna ritardata, orologio
+--     alterato).
+SELECT m._id, COALESCE(c.subject, jc.raw_string) AS chat,
+       datetime(m.timestamp / 1000, 'unixepoch')          AS data_mittente_utc,
+       datetime(m.received_timestamp / 1000, 'unixepoch') AS data_ricezione_utc,
+       round((m.received_timestamp - m.timestamp) / 60000.0, 1) AS differenza_minuti
+FROM message m
+LEFT JOIN chat c ON c._id = m.chat_row_id
+LEFT JOIN jid jc ON jc._id = c.jid_row_id
+WHERE m.from_me = 0
+  AND m.received_timestamp > 0
+  AND abs(m.received_timestamp - m.timestamp) > 3600000
+ORDER BY m.timestamp;
+
+
+-- 7.5 Periodi di inattivita': intervalli superiori a 24 ore tra un
+--     messaggio e il successivo. Un periodo vuoto in un contesto di uso
+--     abituale puo' corrispondere a un'eliminazione massiva.
+SELECT datetime(timestamp / 1000, 'unixepoch')      AS da_utc,
+       datetime(data_succ / 1000, 'unixepoch')      AS a_utc,
+       round((data_succ - timestamp) / 3600000.0, 1) AS ore_vuote
+FROM (SELECT timestamp, LEAD(timestamp) OVER (ORDER BY timestamp) AS data_succ
+      FROM message WHERE timestamp > 0)
+WHERE data_succ - timestamp > 86400000
+ORDER BY ore_vuote DESC;
+
+
+-- 7.6 (Richiede ATTACH di wa.db, vedi 1.6) Associa ai JID delle chat il
+--     nome salvato in rubrica.
+-- SELECT c._id, j.raw_string, w.display_name, w.number
+-- FROM chat c
+-- LEFT JOIN jid j ON j._id = c.jid_row_id
+-- LEFT JOIN wa.wa_contacts w ON w.jid = j.raw_string
+-- ORDER BY c.sort_timestamp DESC;
+
+================================================================================
+ FONTI COMPLEMENTARI PER IL RECUPERO
+================================================================================
+- File -wal: puo' contenere versioni precedenti delle pagine, inclusi record
+  di messaggi gia' eliminati. Analizzarlo prima di qualsiasi checkpoint.
+- Freelist e spazio non allocato del database: possibile carving di record.
+- Backup locali cifrati (Databases/msgstore-AAAA-MM-GG.1.db.crypt14/15):
+  una volta decifrati permettono il confronto con lo stato precedente.
+- Cartella Media di WhatsApp: file sopravvissuti alla rimozione del
+  messaggio.
+- Notifiche di sistema e tabelle di indicizzazione full-text (es.
+  message_ftsv2), che possono conservare testo di messaggi rimossi.
+================================================================================
+ FINE
+================================================================================

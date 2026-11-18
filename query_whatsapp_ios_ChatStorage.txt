@@ -1,0 +1,509 @@
+================================================================================
+ QUERY DI ANALISI FORENSE - WhatsApp iOS - ChatStorage.sqlite
+ Messaggi, chat, media, messaggi eliminati e salti di ID
+================================================================================
+
+NOTE GENERALI
+- Percorso tipico: /private/var/mobile/Containers/Shared/AppGroup/<UUID>/
+  ChatStorage.sqlite (gruppo net.whatsapp.WhatsApp.shared). Analizzare
+  sempre una copia del database insieme ai file -wal e -shm.
+- ChatStorage.sqlite e' un database Core Data: le tabelle hanno prefisso Z,
+  le chiavi primarie sono Z_PK e la tabella Z_PRIMARYKEY contiene per ogni
+  entita' l'ultimo Z_PK assegnato (Z_MAX).
+- Le date sono in Cocoa time (secondi dal 01/01/2001 UTC): si somma
+  978307200 e si usa 'unixepoch'. Gli orari risultanti sono in UTC; per
+  l'ora italiana aggiungere '+2 hours' (CEST) o '+1 hours' (CET).
+- Lo schema cambia tra versioni di WhatsApp. Prima di eseguire le query
+  verificare le colonne con le query della sezione 1. I codici di
+  ZMESSAGETYPE indicati sono quelli piu' comunemente documentati e vanno
+  confermati sul dataset in esame (es. confrontando con il contenuto visibile
+  nell'app o con altri strumenti).
+- I salti di Z_PK NON provano da soli un'eliminazione manuale da parte
+  dell'utente. Possono derivare anche da: aggiornamenti di stato scaduti
+  (24 ore), messaggi effimeri, svuotamento di una chat, eliminazione di una
+  chat, ripristino da backup, record tecnici rimossi dall'app. Vanno sempre
+  contestualizzati (sezione 4).
+- Gli intervalli di date nelle query sono di esempio (26-28/05/2026): il
+  limite superiore e' esclusivo.
+
+
+================================================================================
+ SEZIONE 1 - VERIFICHE PRELIMINARI
+================================================================================
+
+-- 1.1 Elenca tutte le tabelle del database, per verificare quali entita'
+--     sono presenti nella versione di WhatsApp in esame.
+SELECT name FROM sqlite_master WHERE type = 'table' ORDER BY name;
+
+
+-- 1.2 Elenca le colonne delle tabelle principali (messaggi, chat, media,
+--     membri dei gruppi).
+PRAGMA table_info(ZWAMESSAGE);
+PRAGMA table_info(ZWACHATSESSION);
+PRAGMA table_info(ZWAMEDIAITEM);
+PRAGMA table_info(ZWAGROUPMEMBER);
+
+
+-- 1.3 Mostra le entita' Core Data con l'ultimo Z_PK assegnato (Z_MAX).
+--     Serve per stimare quanti record sono stati rimossi.
+SELECT Z_ENT, Z_NAME, Z_MAX FROM Z_PRIMARYKEY ORDER BY Z_ENT;
+
+
+-- 1.4 Conta i messaggi per tipo (ZMESSAGETYPE). Codici frequenti, da
+--     verificare: 0 testo, 1 immagine, 2 video, 3 audio/vocale, 4 contatto,
+--     5 posizione, 6 evento di sistema/gruppo, 7 link, 8 documento,
+--     11 GIF, 14 messaggio eliminato ("Questo messaggio e' stato
+--     eliminato"), 15 sticker.
+SELECT ZMESSAGETYPE, count(*) AS n_messaggi
+FROM ZWAMESSAGE
+GROUP BY ZMESSAGETYPE
+ORDER BY n_messaggi DESC;
+
+
+-- 1.5 Indica l'intervallo temporale coperto dai messaggi presenti.
+SELECT count(*)                                               AS n_messaggi,
+       min(Z_PK)                                              AS z_pk_min,
+       max(Z_PK)                                              AS z_pk_max,
+       datetime(min(ZMESSAGEDATE) + 978307200, 'unixepoch')   AS primo_messaggio_utc,
+       datetime(max(ZMESSAGEDATE) + 978307200, 'unixepoch')   AS ultimo_messaggio_utc
+FROM ZWAMESSAGE;
+
+
+================================================================================
+ SEZIONE 2 - CHAT E MESSAGGI
+================================================================================
+
+-- 2.1 Elenca le chat con tipo, nome, JID, data dell'ultimo messaggio,
+--     numero di messaggi presenti e stato (archiviata/nascosta).
+--     ZSESSIONTYPE: 0 individuale, 1 gruppo, 2 broadcast, 3 stato (da
+--     verificare). Le colonne ZARCHIVED/ZHIDDEN/ZREMOVED potrebbero non
+--     essere tutte presenti.
+SELECT s.Z_PK,
+       s.ZSESSIONTYPE,
+       s.ZPARTNERNAME,
+       s.ZCONTACTJID,
+       datetime(s.ZLASTMESSAGEDATE + 978307200, 'unixepoch') AS ultimo_messaggio_utc,
+       (SELECT count(*) FROM ZWAMESSAGE m WHERE m.ZCHATSESSION = s.Z_PK) AS n_messaggi_presenti,
+       s.ZARCHIVED,
+       s.ZHIDDEN,
+       s.ZREMOVED
+FROM ZWACHATSESSION s
+ORDER BY s.ZLASTMESSAGEDATE DESC;
+
+
+-- 2.2 Elenca tutti i messaggi con chat, mittente, direzione, tipo, testo e
+--     date (invio e messaggio). Per i gruppi riporta il membro mittente.
+SELECT m.Z_PK,
+       s.ZPARTNERNAME                                         AS chat,
+       s.ZCONTACTJID                                          AS jid_chat,
+       CASE m.ZISFROMME WHEN 1 THEN 'inviato' ELSE 'ricevuto' END AS direzione,
+       COALESCE(gm.ZMEMBERJID, m.ZFROMJID)                    AS mittente_jid,
+       gm.ZCONTACTNAME                                        AS mittente_nome_gruppo,
+       m.ZMESSAGETYPE,
+       m.ZTEXT,
+       datetime(m.ZMESSAGEDATE + 978307200, 'unixepoch')      AS data_messaggio_utc,
+       datetime(m.ZSENTDATE + 978307200, 'unixepoch')         AS data_invio_utc,
+       m.ZMESSAGESTATUS,
+       m.ZSTANZAID,
+       m.ZSORT
+FROM ZWAMESSAGE m
+LEFT JOIN ZWACHATSESSION s ON s.Z_PK = m.ZCHATSESSION
+LEFT JOIN ZWAGROUPMEMBER gm ON gm.Z_PK = m.ZGROUPMEMBER
+ORDER BY m.ZMESSAGEDATE;
+
+
+-- 2.3 Messaggi di un intervallo di date, ordinati per data, con chat e
+--     mittente.
+SELECT m.Z_PK,
+       s.ZPARTNERNAME AS chat,
+       CASE m.ZISFROMME WHEN 1 THEN 'inviato' ELSE 'ricevuto' END AS direzione,
+       COALESCE(gm.ZMEMBERJID, m.ZFROMJID) AS mittente_jid,
+       m.ZMESSAGETYPE,
+       m.ZTEXT,
+       datetime(m.ZMESSAGEDATE + 978307200, 'unixepoch') AS data_utc
+FROM ZWAMESSAGE m
+LEFT JOIN ZWACHATSESSION s  ON s.Z_PK = m.ZCHATSESSION
+LEFT JOIN ZWAGROUPMEMBER gm ON gm.Z_PK = m.ZGROUPMEMBER
+WHERE m.ZMESSAGEDATE >= strftime('%s', '2026-05-26 00:00:00') - 978307200
+  AND m.ZMESSAGEDATE <  strftime('%s', '2026-05-29 00:00:00') - 978307200
+ORDER BY m.ZMESSAGEDATE;
+
+
+-- 2.4 Conta i messaggi per chat e per giorno, per individuare picchi di
+--     attivita' o giornate con attivita' anomala.
+SELECT s.ZPARTNERNAME AS chat,
+       date(m.ZMESSAGEDATE + 978307200, 'unixepoch') AS giorno_utc,
+       sum(CASE WHEN m.ZISFROMME = 1 THEN 1 ELSE 0 END) AS inviati,
+       sum(CASE WHEN m.ZISFROMME = 0 THEN 1 ELSE 0 END) AS ricevuti
+FROM ZWAMESSAGE m
+LEFT JOIN ZWACHATSESSION s ON s.Z_PK = m.ZCHATSESSION
+GROUP BY 1, 2
+ORDER BY 2, 1;
+
+
+================================================================================
+ SEZIONE 3 - MESSAGGI ELIMINATI "PER TUTTI" (REVOCATI)
+================================================================================
+
+-- 3.1 Elenca i messaggi eliminati per tutti (segnaposto "Questo messaggio
+--     e' stato eliminato", ZMESSAGETYPE = 14, da verificare). Il record
+--     resta nel database ma il contenuto originale viene rimosso: restano
+--     chat, mittente, direzione e date.
+SELECT m.Z_PK,
+       s.ZPARTNERNAME                                      AS chat,
+       CASE m.ZISFROMME WHEN 1 THEN 'inviato' ELSE 'ricevuto' END AS direzione,
+       COALESCE(gm.ZMEMBERJID, m.ZFROMJID)                 AS mittente_jid,
+       datetime(m.ZMESSAGEDATE + 978307200, 'unixepoch')   AS data_messaggio_utc,
+       datetime(m.ZSENTDATE + 978307200, 'unixepoch')      AS data_invio_utc,
+       m.ZTEXT,
+       m.ZSTANZAID
+FROM ZWAMESSAGE m
+LEFT JOIN ZWACHATSESSION s  ON s.Z_PK = m.ZCHATSESSION
+LEFT JOIN ZWAGROUPMEMBER gm ON gm.Z_PK = m.ZGROUPMEMBER
+WHERE m.ZMESSAGETYPE = 14
+ORDER BY m.ZMESSAGEDATE;
+
+
+-- 3.2 Conta i messaggi eliminati per tutti per chat e direzione: indica
+--     chi elimina i messaggi e in quali conversazioni.
+SELECT s.ZPARTNERNAME AS chat,
+       CASE m.ZISFROMME WHEN 1 THEN 'inviato' ELSE 'ricevuto' END AS direzione,
+       count(*) AS n_eliminati,
+       datetime(min(m.ZMESSAGEDATE) + 978307200, 'unixepoch') AS primo_utc,
+       datetime(max(m.ZMESSAGEDATE) + 978307200, 'unixepoch') AS ultimo_utc
+FROM ZWAMESSAGE m
+LEFT JOIN ZWACHATSESSION s ON s.Z_PK = m.ZCHATSESSION
+WHERE m.ZMESSAGETYPE = 14
+GROUP BY 1, 2
+ORDER BY n_eliminati DESC;
+
+
+-- 3.3 Per ogni messaggio eliminato per tutti, mostra il messaggio
+--     precedente e quello successivo nella stessa chat, per ricostruire il
+--     contesto della conversazione. Richiede SQLite 3.25+ (funzioni
+--     finestra).
+SELECT * FROM (
+  SELECT m.Z_PK,
+         s.ZPARTNERNAME AS chat,
+         m.ZMESSAGETYPE,
+         datetime(m.ZMESSAGEDATE + 978307200, 'unixepoch') AS data_utc,
+         LAG(m.ZTEXT)  OVER (PARTITION BY m.ZCHATSESSION ORDER BY m.ZMESSAGEDATE, m.Z_PK) AS testo_precedente,
+         LEAD(m.ZTEXT) OVER (PARTITION BY m.ZCHATSESSION ORDER BY m.ZMESSAGEDATE, m.Z_PK) AS testo_successivo
+  FROM ZWAMESSAGE m
+  LEFT JOIN ZWACHATSESSION s ON s.Z_PK = m.ZCHATSESSION
+)
+WHERE ZMESSAGETYPE = 14
+ORDER BY data_utc;
+
+
+================================================================================
+ SEZIONE 4 - SALTI DI ID (MESSAGGI RIMOSSI DAL DATABASE)
+================================================================================
+
+-- 4.1 Confronta il numero di messaggi presenti con l'ultimo Z_PK assegnato
+--     all'entita' messaggio (Z_MAX): la differenza e' il numero di record
+--     di messaggio non piu' presenti nel database.
+SELECT (SELECT Z_MAX FROM Z_PRIMARYKEY WHERE Z_NAME = 'WAMessage')        AS z_max_messaggi,
+       (SELECT count(*) FROM ZWAMESSAGE)                                  AS messaggi_presenti,
+       (SELECT Z_MAX FROM Z_PRIMARYKEY WHERE Z_NAME = 'WAMessage')
+         - (SELECT count(*) FROM ZWAMESSAGE)                              AS record_mancanti;
+
+
+-- 4.2 Individua i salti nella sequenza Z_PK di ZWAMESSAGE, con numero di
+--     record mancanti per ciascun salto.
+SELECT Z_PK + 1             AS primo_z_pk_mancante,
+       prossimo - 1         AS ultimo_z_pk_mancante,
+       prossimo - Z_PK - 1  AS n_mancanti
+FROM (SELECT Z_PK, LEAD(Z_PK) OVER (ORDER BY Z_PK) AS prossimo FROM ZWAMESSAGE)
+WHERE prossimo - Z_PK > 1
+ORDER BY Z_PK;
+
+
+-- 4.3 Per ogni salto di Z_PK, mostra il messaggio immediatamente prima e
+--     quello immediatamente dopo (chat, data, direzione, testo). Le date dei
+--     due messaggi delimitano l'intervallo in cui i record mancanti sono
+--     stati creati, e le chat indicano dove cercare. Z_PK riflette l'ordine
+--     di inserimento nel database, che di norma segue l'ordine cronologico
+--     ma non coincide necessariamente con la data del messaggio.
+WITH seq AS (
+  SELECT m.Z_PK,
+         m.ZCHATSESSION,
+         m.ZMESSAGEDATE,
+         m.ZISFROMME,
+         m.ZTEXT,
+         LEAD(m.Z_PK)         OVER (ORDER BY m.Z_PK) AS pk_succ,
+         LEAD(m.ZCHATSESSION) OVER (ORDER BY m.Z_PK) AS chat_succ,
+         LEAD(m.ZMESSAGEDATE) OVER (ORDER BY m.Z_PK) AS data_succ,
+         LEAD(m.ZTEXT)        OVER (ORDER BY m.Z_PK) AS testo_succ
+  FROM ZWAMESSAGE m
+)
+SELECT seq.Z_PK                                              AS pk_prima,
+       seq.pk_succ                                           AS pk_dopo,
+       seq.pk_succ - seq.Z_PK - 1                            AS n_mancanti,
+       s1.ZPARTNERNAME                                       AS chat_prima,
+       datetime(seq.ZMESSAGEDATE + 978307200, 'unixepoch')   AS data_prima_utc,
+       seq.ZTEXT                                             AS testo_prima,
+       s2.ZPARTNERNAME                                       AS chat_dopo,
+       datetime(seq.data_succ + 978307200, 'unixepoch')      AS data_dopo_utc,
+       seq.testo_succ                                        AS testo_dopo
+FROM seq
+LEFT JOIN ZWACHATSESSION s1 ON s1.Z_PK = seq.ZCHATSESSION
+LEFT JOIN ZWACHATSESSION s2 ON s2.Z_PK = seq.chat_succ
+WHERE seq.pk_succ - seq.Z_PK > 1
+ORDER BY seq.Z_PK;
+
+
+-- 4.4 Come la 4.3, ma limitata ai salti i cui messaggi adiacenti cadono
+--     nell'intervallo di date di interesse.
+WITH seq AS (
+  SELECT m.Z_PK, m.ZCHATSESSION, m.ZMESSAGEDATE,
+         LEAD(m.Z_PK)         OVER (ORDER BY m.Z_PK) AS pk_succ,
+         LEAD(m.ZCHATSESSION) OVER (ORDER BY m.Z_PK) AS chat_succ,
+         LEAD(m.ZMESSAGEDATE) OVER (ORDER BY m.Z_PK) AS data_succ
+  FROM ZWAMESSAGE m
+)
+SELECT seq.Z_PK AS pk_prima, seq.pk_succ AS pk_dopo,
+       seq.pk_succ - seq.Z_PK - 1 AS n_mancanti,
+       s1.ZPARTNERNAME AS chat_prima,
+       datetime(seq.ZMESSAGEDATE + 978307200, 'unixepoch') AS data_prima_utc,
+       s2.ZPARTNERNAME AS chat_dopo,
+       datetime(seq.data_succ + 978307200, 'unixepoch')    AS data_dopo_utc
+FROM seq
+LEFT JOIN ZWACHATSESSION s1 ON s1.Z_PK = seq.ZCHATSESSION
+LEFT JOIN ZWACHATSESSION s2 ON s2.Z_PK = seq.chat_succ
+WHERE seq.pk_succ - seq.Z_PK > 1
+  AND seq.ZMESSAGEDATE >= strftime('%s', '2026-05-26 00:00:00') - 978307200
+  AND seq.data_succ    <  strftime('%s', '2026-05-29 00:00:00') - 978307200
+ORDER BY seq.Z_PK;
+
+
+-- 4.5 Salti nella sequenza ZSORT all'interno di ciascuna chat. ZSORT e'
+--     un progressivo di ordinamento dei messaggi nella chat: un salto
+--     indica messaggi di quella specifica conversazione non piu' presenti.
+--     Verificare sul dataset che ZSORT sia effettivamente progressivo per
+--     chat (in condizioni normali gli incrementi sono di 1).
+WITH seq AS (
+  SELECT m.ZCHATSESSION, m.Z_PK, m.ZSORT, m.ZMESSAGEDATE,
+         LEAD(m.ZSORT)        OVER (PARTITION BY m.ZCHATSESSION ORDER BY m.ZSORT) AS sort_succ,
+         LEAD(m.ZMESSAGEDATE) OVER (PARTITION BY m.ZCHATSESSION ORDER BY m.ZSORT) AS data_succ
+  FROM ZWAMESSAGE m
+)
+SELECT s.ZPARTNERNAME AS chat,
+       seq.ZSORT AS sort_prima, seq.sort_succ AS sort_dopo,
+       seq.sort_succ - seq.ZSORT - 1 AS n_mancanti,
+       datetime(seq.ZMESSAGEDATE + 978307200, 'unixepoch') AS data_prima_utc,
+       datetime(seq.data_succ + 978307200, 'unixepoch')    AS data_dopo_utc
+FROM seq
+LEFT JOIN ZWACHATSESSION s ON s.Z_PK = seq.ZCHATSESSION
+WHERE seq.sort_succ - seq.ZSORT > 1
+ORDER BY chat, seq.ZSORT;
+
+
+-- 4.6 Riepilogo per chat dei messaggi mancanti calcolati su ZSORT:
+--     individua le conversazioni con il maggior numero di messaggi rimossi.
+WITH seq AS (
+  SELECT m.ZCHATSESSION, m.ZSORT,
+         LEAD(m.ZSORT) OVER (PARTITION BY m.ZCHATSESSION ORDER BY m.ZSORT) AS sort_succ
+  FROM ZWAMESSAGE m
+)
+SELECT s.ZPARTNERNAME AS chat, s.ZSESSIONTYPE,
+       count(*) AS n_salti,
+       sum(seq.sort_succ - seq.ZSORT - 1) AS tot_mancanti
+FROM seq
+LEFT JOIN ZWACHATSESSION s ON s.Z_PK = seq.ZCHATSESSION
+WHERE seq.sort_succ - seq.ZSORT > 1
+GROUP BY seq.ZCHATSESSION
+ORDER BY tot_mancanti DESC;
+
+
+-- 4.7 Confronta per ogni chat il contatore dei messaggi registrato
+--     dall'app (ZMESSAGECOUNTER, se presente) con i messaggi effettivamente
+--     presenti. Una differenza positiva suggerisce messaggi rimossi.
+SELECT s.Z_PK, s.ZPARTNERNAME AS chat, s.ZSESSIONTYPE,
+       s.ZMESSAGECOUNTER,
+       count(m.Z_PK) AS messaggi_presenti,
+       s.ZMESSAGECOUNTER - count(m.Z_PK) AS differenza
+FROM ZWACHATSESSION s
+LEFT JOIN ZWAMESSAGE m ON m.ZCHATSESSION = s.Z_PK
+GROUP BY s.Z_PK
+HAVING differenza <> 0
+ORDER BY differenza DESC;
+
+
+-- 4.8 Salti nella sequenza Z_PK delle chat (ZWACHATSESSION): indicano
+--     chat eliminate.
+SELECT Z_PK + 1 AS primo_z_pk_mancante,
+       prossimo - 1 AS ultimo_z_pk_mancante,
+       prossimo - Z_PK - 1 AS n_mancanti
+FROM (SELECT Z_PK, LEAD(Z_PK) OVER (ORDER BY Z_PK) AS prossimo FROM ZWACHATSESSION)
+WHERE prossimo - Z_PK > 1
+ORDER BY Z_PK;
+
+
+-- 4.9 Messaggi "orfani": messaggi che puntano a una chat non piu' presente.
+--     Possono indicare un'eliminazione parziale o un'incoerenza da
+--     approfondire.
+SELECT m.Z_PK, m.ZCHATSESSION, m.ZFROMJID, m.ZTOJID, m.ZTEXT,
+       datetime(m.ZMESSAGEDATE + 978307200, 'unixepoch') AS data_utc
+FROM ZWAMESSAGE m
+LEFT JOIN ZWACHATSESSION s ON s.Z_PK = m.ZCHATSESSION
+WHERE m.ZCHATSESSION IS NOT NULL AND s.Z_PK IS NULL
+ORDER BY m.ZMESSAGEDATE;
+
+
+-- 4.10 Media "orfani": record di ZWAMEDIAITEM che puntano a un messaggio
+--      non piu' presente. Possono conservare percorso del file, dimensione,
+--      titolo o coordinate di un messaggio eliminato.
+SELECT mi.Z_PK, mi.ZMESSAGE, mi.ZMEDIALOCALPATH, mi.ZTHUMBNAILLOCALPATH,
+       mi.ZFILESIZE, mi.ZTITLE, mi.ZLATITUDE, mi.ZLONGITUDE
+FROM ZWAMEDIAITEM mi
+LEFT JOIN ZWAMESSAGE m ON m.Z_PK = mi.ZMESSAGE
+WHERE mi.ZMESSAGE IS NOT NULL AND m.Z_PK IS NULL;
+
+
+================================================================================
+ SEZIONE 5 - MEDIA, POSIZIONI E CONTATTI
+================================================================================
+
+-- 5.1 Elenca i messaggi con allegati: tipo, percorso locale del file,
+--     miniatura, dimensione, titolo/didascalia e URL.
+SELECT m.Z_PK,
+       s.ZPARTNERNAME AS chat,
+       CASE m.ZISFROMME WHEN 1 THEN 'inviato' ELSE 'ricevuto' END AS direzione,
+       m.ZMESSAGETYPE,
+       datetime(m.ZMESSAGEDATE + 978307200, 'unixepoch') AS data_utc,
+       mi.ZMEDIALOCALPATH, mi.ZTHUMBNAILLOCALPATH, mi.ZFILESIZE,
+       mi.ZTITLE, mi.ZMEDIAURL
+FROM ZWAMESSAGE m
+JOIN ZWAMEDIAITEM mi       ON mi.Z_PK = m.ZMEDIAITEM
+LEFT JOIN ZWACHATSESSION s ON s.Z_PK = m.ZCHATSESSION
+ORDER BY m.ZMESSAGEDATE;
+
+
+-- 5.2 Media referenziati nel database il cui file non e' piu' disponibile
+--     andranno verificati sul file system: questa query estrae l'elenco
+--     dei percorsi locali da confrontare con la cartella Message/Media
+--     dell'AppGroup.
+SELECT DISTINCT mi.ZMEDIALOCALPATH
+FROM ZWAMEDIAITEM mi
+WHERE mi.ZMEDIALOCALPATH IS NOT NULL
+ORDER BY 1;
+
+
+-- 5.3 Posizioni condivise (ZMESSAGETYPE = 5, da verificare), con
+--     coordinate.
+SELECT m.Z_PK, s.ZPARTNERNAME AS chat,
+       CASE m.ZISFROMME WHEN 1 THEN 'inviato' ELSE 'ricevuto' END AS direzione,
+       datetime(m.ZMESSAGEDATE + 978307200, 'unixepoch') AS data_utc,
+       mi.ZLATITUDE, mi.ZLONGITUDE, mi.ZTITLE
+FROM ZWAMESSAGE m
+JOIN ZWAMEDIAITEM mi       ON mi.Z_PK = m.ZMEDIAITEM
+LEFT JOIN ZWACHATSESSION s ON s.Z_PK = m.ZCHATSESSION
+WHERE mi.ZLATITUDE IS NOT NULL AND mi.ZLATITUDE <> 0
+ORDER BY m.ZMESSAGEDATE;
+
+
+-- 5.4 Contatti condivisi (vCard).
+SELECT m.Z_PK, s.ZPARTNERNAME AS chat,
+       datetime(m.ZMESSAGEDATE + 978307200, 'unixepoch') AS data_utc,
+       mi.ZVCARDNAME, mi.ZVCARDSTRING
+FROM ZWAMESSAGE m
+JOIN ZWAMEDIAITEM mi       ON mi.Z_PK = m.ZMEDIAITEM
+LEFT JOIN ZWACHATSESSION s ON s.Z_PK = m.ZCHATSESSION
+WHERE mi.ZVCARDSTRING IS NOT NULL
+ORDER BY m.ZMESSAGEDATE;
+
+
+================================================================================
+ SEZIONE 6 - GRUPPI E CONTATTI
+================================================================================
+
+-- 6.1 Membri dei gruppi, con JID e nome, per ciascuna chat di gruppo.
+SELECT s.ZPARTNERNAME AS gruppo, s.ZCONTACTJID AS jid_gruppo,
+       gm.ZMEMBERJID, gm.ZCONTACTNAME, gm.ZFIRSTNAME
+FROM ZWAGROUPMEMBER gm
+LEFT JOIN ZWACHATSESSION s ON s.Z_PK = gm.ZCHATSESSION
+ORDER BY gruppo, gm.ZMEMBERJID;
+
+
+-- 6.2 Nomi profilo (push name) associati ai JID, utili per identificare i
+--     mittenti non salvati in rubrica.
+SELECT ZJID, ZPUSHNAME FROM ZWAPROFILEPUSHNAME ORDER BY ZJID;
+
+
+-- 6.3 Eventi di sistema dei gruppi (ZMESSAGETYPE = 6, da verificare):
+--     ingressi, uscite, rimozioni, cambi di nome o di impostazioni.
+SELECT m.Z_PK, s.ZPARTNERNAME AS gruppo,
+       datetime(m.ZMESSAGEDATE + 978307200, 'unixepoch') AS data_utc,
+       m.ZGROUPEVENTTYPE, m.ZFROMJID, m.ZTEXT
+FROM ZWAMESSAGE m
+LEFT JOIN ZWACHATSESSION s ON s.Z_PK = m.ZCHATSESSION
+WHERE m.ZMESSAGETYPE = 6
+ORDER BY m.ZMESSAGEDATE;
+
+
+================================================================================
+ SEZIONE 7 - ALTRE VERIFICHE
+================================================================================
+
+-- 7.1 Messaggi importanti (stellati).
+SELECT m.Z_PK, s.ZPARTNERNAME AS chat, m.ZTEXT,
+       datetime(m.ZMESSAGEDATE + 978307200, 'unixepoch') AS data_utc
+FROM ZWAMESSAGE m
+LEFT JOIN ZWACHATSESSION s ON s.Z_PK = m.ZCHATSESSION
+WHERE m.ZSTARRED = 1
+ORDER BY m.ZMESSAGEDATE;
+
+
+-- 7.2 Ricerca per parola chiave nel testo dei messaggi (sostituire
+--     'parola' con il termine di interesse).
+SELECT m.Z_PK, s.ZPARTNERNAME AS chat,
+       CASE m.ZISFROMME WHEN 1 THEN 'inviato' ELSE 'ricevuto' END AS direzione,
+       m.ZTEXT,
+       datetime(m.ZMESSAGEDATE + 978307200, 'unixepoch') AS data_utc
+FROM ZWAMESSAGE m
+LEFT JOIN ZWACHATSESSION s ON s.Z_PK = m.ZCHATSESSION
+WHERE m.ZTEXT LIKE '%parola%'
+ORDER BY m.ZMESSAGEDATE;
+
+
+-- 7.3 Incongruenze temporali: messaggi la cui data di invio e la data del
+--     messaggio differiscono di oltre 1 ora. Possono indicare messaggi
+--     ricevuti in ritardo, dispositivo offline o orologio alterato.
+SELECT m.Z_PK, s.ZPARTNERNAME AS chat,
+       datetime(m.ZMESSAGEDATE + 978307200, 'unixepoch') AS data_messaggio_utc,
+       datetime(m.ZSENTDATE + 978307200, 'unixepoch')    AS data_invio_utc,
+       round((m.ZMESSAGEDATE - m.ZSENTDATE) / 60.0, 1)   AS differenza_minuti
+FROM ZWAMESSAGE m
+LEFT JOIN ZWACHATSESSION s ON s.Z_PK = m.ZCHATSESSION
+WHERE m.ZSENTDATE IS NOT NULL
+  AND abs(m.ZMESSAGEDATE - m.ZSENTDATE) > 3600
+ORDER BY m.ZMESSAGEDATE;
+
+
+-- 7.4 Periodi di inattivita': intervalli superiori a 24 ore tra un
+--     messaggio e il successivo (in ordine di data). Un periodo vuoto in un
+--     contesto di uso abituale puo' corrispondere a un'eliminazione
+--     massiva di messaggi.
+SELECT datetime(ZMESSAGEDATE + 978307200, 'unixepoch')     AS da_utc,
+       datetime(data_succ + 978307200, 'unixepoch')        AS a_utc,
+       round((data_succ - ZMESSAGEDATE) / 3600.0, 1)       AS ore_vuote
+FROM (SELECT ZMESSAGEDATE,
+             LEAD(ZMESSAGEDATE) OVER (ORDER BY ZMESSAGEDATE) AS data_succ
+      FROM ZWAMESSAGE)
+WHERE data_succ - ZMESSAGEDATE > 86400
+ORDER BY ore_vuote DESC;
+
+================================================================================
+ FONTI COMPLEMENTARI PER IL RECUPERO
+================================================================================
+- File -wal: puo' contenere versioni precedenti delle pagine, inclusi record
+  di messaggi gia' eliminati. Analizzarlo prima di qualsiasi checkpoint.
+- Freelist e spazio non allocato del database: possibile carving di record.
+- Cartella Message/Media dell'AppGroup e miniature: file sopravvissuti alla
+  rimozione del messaggio.
+- Backup iCloud/iTunes e database di notifiche o di sistema che conservano
+  anteprime dei messaggi.
+================================================================================
+ FINE
+================================================================================

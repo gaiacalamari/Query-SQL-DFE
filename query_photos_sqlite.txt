@@ -1,0 +1,400 @@
+================================================================================
+ QUERY DI ANALISI FORENSE - Photos.sqlite (iOS)
+ Cestinamenti, eliminazioni definitive e persistent history (ACHANGE)
+================================================================================
+
+NOTE GENERALI
+- I timestamp Core Data sono in Cocoa time (secondi dal 01/01/2001 UTC):
+  per convertirli si somma 978307200 e si usa il modificatore 'unixepoch'.
+- Tutti gli orari restituiti dalle query sono in UTC. Per l'ora italiana
+  aggiungere '+2 hours' (ora legale, CEST) o '+1 hours' (ora solare, CET).
+  Evitare il modificatore 'localtime', che usa il fuso della macchina di
+  analisi e non quello del dispositivo.
+- Gli intervalli di date sono indicati come esempio (26/05/2026 - 28/05/2026):
+  modificarli secondo il caso. Il limite superiore e' sempre esclusivo
+  (mezzanotte del giorno successivo), cosi' da includere l'intera giornata.
+- I nomi delle colonne variano tra versioni di iOS: verificarli con le
+  query della sezione 1 prima di eseguire le altre.
+- Lavorare sempre su una copia del database, insieme ai file -wal e -shm.
+- Il significato dei campi ZTOMBSTONEn dipende dall'entita' e dalla versione
+  di iOS. Nel caso analizzato, per l'entita' Asset: ZTOMBSTONE0 = UUID
+  dell'asset + "#PrimarySync", ZTOMBSTONE2 = motivazione dell'eliminazione,
+  ZTOMBSTONE3 = data di spostamento nel cestino. Verificare la mappatura su
+  ogni nuovo dispositivo.
+
+
+================================================================================
+ SEZIONE 1 - VERIFICHE PRELIMINARI
+================================================================================
+
+-- 1.1 Elenca le colonne della tabella ZASSET, per verificare la presenza di
+--     campi come ZTRASHEDSTATE, ZTRASHEDDATE, ZTRASHEDREASON,
+--     ZTRASHEDBYPARTICIPANT nella versione di iOS in esame.
+PRAGMA table_info(ZASSET);
+
+
+-- 1.2 Elenca le colonne della tabella ACHANGE, per sapere quanti campi
+--     ZTOMBSTONE sono presenti.
+PRAGMA table_info(ACHANGE);
+
+
+-- 1.3 Elenca le entita' Core Data del database con il relativo codice
+--     (Z_ENT) e l'ultimo Z_PK assegnato (Z_MAX). Serve per risolvere il
+--     campo ZENTITY di ACHANGE e per stimare i record rimossi.
+SELECT Z_ENT, Z_NAME, Z_MAX
+FROM Z_PRIMARYKEY
+ORDER BY Z_ENT;
+
+
+-- 1.4 Indica l'intervallo temporale coperto dalla persistent history
+--     (prima e ultima transazione registrata). Lo storico viene potato
+--     periodicamente: eventi anteriori alla prima transazione non sono
+--     documentabili tramite ACHANGE.
+SELECT count(*)                                              AS n_transazioni,
+       datetime(min(ZTIMESTAMP) + 978307200, 'unixepoch')   AS prima_transazione_utc,
+       datetime(max(ZTIMESTAMP) + 978307200, 'unixepoch')   AS ultima_transazione_utc
+FROM ATRANSACTION;
+
+
+-- 1.5 Conta le modifiche registrate in ACHANGE per entita' e tipo
+--     (0 = inserimento, 1 = aggiornamento, 2 = eliminazione).
+--     Fornisce una panoramica del contenuto dello storico.
+SELECT pk.Z_NAME AS entita,
+       CASE c.ZCHANGETYPE WHEN 0 THEN 'insert'
+                          WHEN 1 THEN 'update'
+                          WHEN 2 THEN 'delete' END AS tipo,
+       count(*) AS n_modifiche
+FROM ACHANGE c
+LEFT JOIN Z_PRIMARYKEY pk ON pk.Z_ENT = c.ZENTITY
+GROUP BY 1, 2
+ORDER BY 1, 2;
+
+
+================================================================================
+ SEZIONE 2 - CONTENUTI ATTUALMENTE NEL CESTINO
+================================================================================
+
+-- 2.1 Elenca gli asset attualmente presenti nell'album "Eliminati di
+--     recente" (ZTRASHEDSTATE = 1), con nome file, nome originale, data di
+--     creazione, data di cestinamento e data prevista per l'eliminazione
+--     automatica (cestinamento + 30 giorni).
+SELECT a.Z_PK,
+       a.ZUUID,
+       a.ZDIRECTORY || '/' || a.ZFILENAME                                AS percorso,
+       aa.ZORIGINALFILENAME                                              AS nome_originale,
+       datetime(a.ZDATECREATED + 978307200, 'unixepoch')                 AS creazione_utc,
+       datetime(a.ZTRASHEDDATE + 978307200, 'unixepoch')                 AS cestinato_utc,
+       datetime(a.ZTRASHEDDATE + 978307200 + 30*86400, 'unixepoch')      AS expunge_automatico_previsto_utc
+FROM ZASSET a
+LEFT JOIN ZADDITIONALASSETATTRIBUTES aa ON aa.ZASSET = a.Z_PK
+WHERE a.ZTRASHEDSTATE = 1
+ORDER BY a.ZTRASHEDDATE;
+
+
+-- 2.2 Elenca gli album attualmente nel cestino, con titolo e data di
+--     cestinamento.
+SELECT Z_PK, ZUUID, ZTITLE, ZKIND,
+       datetime(ZTRASHEDDATE + 978307200, 'unixepoch') AS cestinato_utc
+FROM ZGENERICALBUM
+WHERE ZTRASHEDSTATE = 1
+ORDER BY ZTRASHEDDATE;
+
+
+================================================================================
+ SEZIONE 3 - ELIMINAZIONI DEFINITIVE (ACHANGE, ZCHANGETYPE = 2)
+================================================================================
+
+-- 3.1 Elenca tutte le eliminazioni definitive di asset registrate nello
+--     storico, una riga per asset, con orario della transazione, contesto
+--     (autore, bundle, processo, nome del contesto) e campi tombstone.
+SELECT c.Z_PK,
+       c.ZENTITYPK,
+       c.ZTRANSACTIONID,
+       datetime(t.ZTIMESTAMP + 978307200, 'unixepoch')    AS expunge_utc,
+       sa.ZNAME AS autore, sb.ZNAME AS bundle, sp.ZNAME AS processo, sc.ZNAME AS contesto,
+       c.ZTOMBSTONE0, c.ZTOMBSTONE1, c.ZTOMBSTONE2,
+       datetime(c.ZTOMBSTONE3 + 978307200, 'unixepoch')   AS tombstone3_utc
+FROM ACHANGE c
+JOIN Z_PRIMARYKEY pk            ON pk.Z_ENT = c.ZENTITY AND pk.Z_NAME = 'Asset'
+LEFT JOIN ATRANSACTION t        ON t.Z_PK  = c.ZTRANSACTIONID
+LEFT JOIN ATRANSACTIONSTRING sa ON sa.Z_PK = t.ZAUTHORTS
+LEFT JOIN ATRANSACTIONSTRING sb ON sb.Z_PK = t.ZBUNDLEIDTS
+LEFT JOIN ATRANSACTIONSTRING sp ON sp.Z_PK = t.ZPROCESSIDTS
+LEFT JOIN ATRANSACTIONSTRING sc ON sc.Z_PK = t.ZCONTEXTNAMETS
+WHERE c.ZCHANGETYPE = 2
+ORDER BY t.ZTIMESTAMP;
+
+
+-- 3.2 Riepiloga le eliminazioni definitive di asset nell'intervallo di date,
+--     raggruppate per minuto e motivazione, con il numero di asset coinvolti.
+SELECT strftime('%Y-%m-%d %H:%M', t.ZTIMESTAMP + 978307200, 'unixepoch') AS minuto_utc,
+       c.ZTOMBSTONE2,
+       count(*) AS n_asset
+FROM ACHANGE c
+JOIN Z_PRIMARYKEY pk     ON pk.Z_ENT = c.ZENTITY AND pk.Z_NAME = 'Asset'
+LEFT JOIN ATRANSACTION t ON t.Z_PK = c.ZTRANSACTIONID
+WHERE c.ZCHANGETYPE = 2
+  AND t.ZTIMESTAMP >= strftime('%s', '2026-05-26 00:00:00') - 978307200
+  AND t.ZTIMESTAMP <  strftime('%s', '2026-05-29 00:00:00') - 978307200
+GROUP BY 1, 2
+ORDER BY 1;
+
+
+-- 3.3 Come la 3.2, ma con l'orario espresso anche in ora italiana (CEST).
+--     Gli estremi dell'intervallo sono spostati di 2 ore, in modo che le date
+--     26-28/05 si riferiscano all'ora locale.
+SELECT strftime('%Y-%m-%d %H:%M', t.ZTIMESTAMP + 978307200, 'unixepoch')             AS minuto_utc,
+       strftime('%Y-%m-%d %H:%M', t.ZTIMESTAMP + 978307200, 'unixepoch', '+2 hours') AS minuto_cest,
+       c.ZTOMBSTONE2,
+       count(*) AS n_asset
+FROM ACHANGE c
+JOIN Z_PRIMARYKEY pk     ON pk.Z_ENT = c.ZENTITY AND pk.Z_NAME = 'Asset'
+LEFT JOIN ATRANSACTION t ON t.Z_PK = c.ZTRANSACTIONID
+WHERE c.ZCHANGETYPE = 2
+  AND t.ZTIMESTAMP >= strftime('%s', '2026-05-25 22:00:00') - 978307200
+  AND t.ZTIMESTAMP <  strftime('%s', '2026-05-28 22:00:00') - 978307200
+GROUP BY 1, 2, 3
+ORDER BY 1;
+
+
+-- 3.4 Riepiloga ogni evento di eliminazione definitiva al secondo, con:
+--     numero di asset, numero di transazioni distinte (1 = singola
+--     operazione), intervallo delle date di cestinamento (ZTOMBSTONE3) e
+--     tipo di dato del campo (atteso 'real').
+SELECT strftime('%Y-%m-%d %H:%M:%S', t.ZTIMESTAMP + 978307200, 'unixepoch') AS expunge_utc,
+       c.ZTOMBSTONE2,
+       count(*)                                                AS n_asset,
+       count(DISTINCT c.ZTRANSACTIONID)                        AS n_transazioni,
+       datetime(min(c.ZTOMBSTONE3) + 978307200, 'unixepoch')   AS tomb3_min_utc,
+       datetime(max(c.ZTOMBSTONE3) + 978307200, 'unixepoch')   AS tomb3_max_utc,
+       typeof(c.ZTOMBSTONE3)                                   AS tipo_tomb3
+FROM ACHANGE c
+JOIN Z_PRIMARYKEY pk     ON pk.Z_ENT = c.ZENTITY AND pk.Z_NAME = 'Asset'
+LEFT JOIN ATRANSACTION t ON t.Z_PK = c.ZTRANSACTIONID
+WHERE c.ZCHANGETYPE = 2
+  AND t.ZTIMESTAMP >= strftime('%s', '2026-05-26 00:00:00') - 978307200
+  AND t.ZTIMESTAMP <  strftime('%s', '2026-05-29 00:00:00') - 978307200
+GROUP BY 1, 2
+ORDER BY 1;
+
+
+-- 3.5 Calcola, per ogni evento di eliminazione definitiva, quanti giorni
+--     sono trascorsi tra il cestinamento (ZTOMBSTONE3) e l'eliminazione.
+--     Per gli asset scaduti automaticamente il valore atteso e' circa 30:
+--     serve a validare l'interpretazione di ZTOMBSTONE3 come data di
+--     cestinamento.
+SELECT strftime('%Y-%m-%d %H:%M:%S', t.ZTIMESTAMP + 978307200, 'unixepoch') AS expunge_utc,
+       c.ZTOMBSTONE2,
+       count(*) AS n_asset,
+       round(min(t.ZTIMESTAMP - c.ZTOMBSTONE3) / 86400.0, 2) AS giorni_min,
+       round(max(t.ZTIMESTAMP - c.ZTOMBSTONE3) / 86400.0, 2) AS giorni_max
+FROM ACHANGE c
+JOIN Z_PRIMARYKEY pk     ON pk.Z_ENT = c.ZENTITY AND pk.Z_NAME = 'Asset'
+LEFT JOIN ATRANSACTION t ON t.Z_PK = c.ZTRANSACTIONID
+WHERE c.ZCHANGETYPE = 2
+GROUP BY 1, 2
+ORDER BY 1;
+
+
+================================================================================
+ SEZIONE 4 - RICOSTRUZIONE DEI CESTINAMENTI
+================================================================================
+
+-- 4.1 Scompone ogni evento di eliminazione definitiva per giorno di
+--     cestinamento, con numero di asset e orario del primo e dell'ultimo
+--     cestinamento di quel giorno. Mostra da quali sessioni provengono gli
+--     elementi eliminati.
+SELECT strftime('%Y-%m-%d %H:%M:%S', t.ZTIMESTAMP + 978307200, 'unixepoch') AS expunge_utc,
+       substr(c.ZTOMBSTONE2, instr(c.ZTOMBSTONE2, 'reason:') + 8)       AS motivo,
+       date(c.ZTOMBSTONE3 + 978307200, 'unixepoch')                     AS giorno_cestinamento_utc,
+       count(*) AS n_asset,
+       time(min(c.ZTOMBSTONE3) + 978307200, 'unixepoch') AS prima,
+       time(max(c.ZTOMBSTONE3) + 978307200, 'unixepoch') AS ultima
+FROM ACHANGE c
+JOIN Z_PRIMARYKEY pk     ON pk.Z_ENT = c.ZENTITY AND pk.Z_NAME = 'Asset'
+LEFT JOIN ATRANSACTION t ON t.Z_PK = c.ZTRANSACTIONID
+WHERE c.ZCHANGETYPE = 2
+  AND t.ZTIMESTAMP >= strftime('%s', '2026-05-26 00:00:00') - 978307200
+  AND t.ZTIMESTAMP <  strftime('%s', '2026-05-29 00:00:00') - 978307200
+GROUP BY 1, 2, 3
+ORDER BY 1, 3;
+
+
+-- 4.2 Scompone i cestinamenti per ora (UTC e CEST), indipendentemente
+--     dall'evento di eliminazione. Serve a individuare le singole sessioni
+--     di cestinamento nelle giornate con molti elementi.
+SELECT strftime('%Y-%m-%d %H:00', c.ZTOMBSTONE3 + 978307200, 'unixepoch')             AS ora_cestinamento_utc,
+       strftime('%Y-%m-%d %H:00', c.ZTOMBSTONE3 + 978307200, 'unixepoch', '+2 hours') AS ora_cestinamento_cest,
+       count(*) AS n_asset,
+       time(min(c.ZTOMBSTONE3) + 978307200, 'unixepoch') AS prima_utc,
+       time(max(c.ZTOMBSTONE3) + 978307200, 'unixepoch') AS ultima_utc
+FROM ACHANGE c
+JOIN Z_PRIMARYKEY pk ON pk.Z_ENT = c.ZENTITY AND pk.Z_NAME = 'Asset'
+WHERE c.ZCHANGETYPE = 2
+  AND c.ZTOMBSTONE3 IS NOT NULL
+GROUP BY 1, 2
+ORDER BY 1;
+
+
+-- 4.3 Individua i cestinamenti avvenuti nello stesso secondo (piu' asset con
+--     identico ZTOMBSTONE3): indicano una singola operazione su una
+--     selezione multipla.
+SELECT datetime(c.ZTOMBSTONE3 + 978307200, 'unixepoch') AS cestinato_utc,
+       count(*) AS n_asset
+FROM ACHANGE c
+JOIN Z_PRIMARYKEY pk ON pk.Z_ENT = c.ZENTITY AND pk.Z_NAME = 'Asset'
+WHERE c.ZCHANGETYPE = 2
+  AND c.ZTOMBSTONE3 IS NOT NULL
+GROUP BY 1
+HAVING count(*) > 1
+ORDER BY 1;
+
+
+-- 4.4 Per gli asset eliminati definitivamente, cerca in ACHANGE
+--     l'aggiornamento (ZCHANGETYPE = 1) corrispondente al cestinamento
+--     (transazione entro 5 secondi da ZTOMBSTONE3) e ne mostra il contesto.
+--     Serve a stabilire se il cestinamento e' avvenuto localmente sul
+--     dispositivo (es. app Foto) o e' arrivato tramite sincronizzazione
+--     iCloud da un altro dispositivo. La tolleranza di 5 secondi e'
+--     arbitraria. Gli aggiornamenti piu' vecchi potrebbero essere stati
+--     rimossi dalla potatura dello storico (vedi query 1.4).
+SELECT d.ZENTITYPK,
+       datetime(d.ZTOMBSTONE3 + 978307200, 'unixepoch') AS cestinato_utc,
+       datetime(tu.ZTIMESTAMP + 978307200, 'unixepoch') AS tx_update_utc,
+       sa.ZNAME AS autore, sb.ZNAME AS bundle, sp.ZNAME AS processo, sc.ZNAME AS contesto
+FROM ACHANGE d
+JOIN Z_PRIMARYKEY pk            ON pk.Z_ENT = d.ZENTITY AND pk.Z_NAME = 'Asset'
+JOIN ATRANSACTION td            ON td.Z_PK = d.ZTRANSACTIONID
+JOIN ACHANGE u                  ON u.ZENTITY = d.ZENTITY
+                               AND u.ZENTITYPK = d.ZENTITYPK
+                               AND u.ZCHANGETYPE = 1
+JOIN ATRANSACTION tu            ON tu.Z_PK = u.ZTRANSACTIONID
+LEFT JOIN ATRANSACTIONSTRING sa ON sa.Z_PK = tu.ZAUTHORTS
+LEFT JOIN ATRANSACTIONSTRING sb ON sb.Z_PK = tu.ZBUNDLEIDTS
+LEFT JOIN ATRANSACTIONSTRING sp ON sp.Z_PK = tu.ZPROCESSIDTS
+LEFT JOIN ATRANSACTIONSTRING sc ON sc.Z_PK = tu.ZCONTEXTNAMETS
+WHERE d.ZCHANGETYPE = 2
+  AND td.ZTIMESTAMP >= strftime('%s', '2026-05-26 00:00:00') - 978307200
+  AND td.ZTIMESTAMP <  strftime('%s', '2026-05-29 00:00:00') - 978307200
+  AND abs(tu.ZTIMESTAMP - d.ZTOMBSTONE3) < 5
+ORDER BY d.ZTOMBSTONE3;
+
+
+-- 4.5 Riepilogo della 4.4: conta i cestinamenti per autore, bundle,
+--     processo e contesto, per distinguere a colpo d'occhio azioni locali
+--     e azioni sincronizzate.
+SELECT sa.ZNAME AS autore, sb.ZNAME AS bundle, sp.ZNAME AS processo, sc.ZNAME AS contesto,
+       count(*) AS n_cestinamenti
+FROM ACHANGE d
+JOIN Z_PRIMARYKEY pk            ON pk.Z_ENT = d.ZENTITY AND pk.Z_NAME = 'Asset'
+JOIN ACHANGE u                  ON u.ZENTITY = d.ZENTITY
+                               AND u.ZENTITYPK = d.ZENTITYPK
+                               AND u.ZCHANGETYPE = 1
+JOIN ATRANSACTION tu            ON tu.Z_PK = u.ZTRANSACTIONID
+LEFT JOIN ATRANSACTIONSTRING sa ON sa.Z_PK = tu.ZAUTHORTS
+LEFT JOIN ATRANSACTIONSTRING sb ON sb.Z_PK = tu.ZBUNDLEIDTS
+LEFT JOIN ATRANSACTIONSTRING sp ON sp.Z_PK = tu.ZPROCESSIDTS
+LEFT JOIN ATRANSACTIONSTRING sc ON sc.Z_PK = tu.ZCONTEXTNAMETS
+WHERE d.ZCHANGETYPE = 2
+  AND abs(tu.ZTIMESTAMP - d.ZTOMBSTONE3) < 5
+GROUP BY 1, 2, 3, 4
+ORDER BY n_cestinamenti DESC;
+
+
+-- 4.6 Per gli asset ancora presenti in ZASSET (ad esempio quelli oggi nel
+--     cestino), cerca l'aggiornamento in ACHANGE corrispondente alla data
+--     di cestinamento (ZTRASHEDDATE) e ne mostra il contesto.
+SELECT c.Z_PK, c.ZENTITYPK, a.ZUUID, a.ZFILENAME,
+       datetime(t.ZTIMESTAMP + 978307200, 'unixepoch')    AS tx_utc,
+       datetime(a.ZTRASHEDDATE + 978307200, 'unixepoch')  AS cestinato_utc,
+       sb.ZNAME AS bundle, sp.ZNAME AS processo, sc.ZNAME AS contesto
+FROM ACHANGE c
+JOIN Z_PRIMARYKEY pk            ON pk.Z_ENT = c.ZENTITY AND pk.Z_NAME = 'Asset'
+JOIN ZASSET a                   ON a.Z_PK = c.ZENTITYPK
+LEFT JOIN ATRANSACTION t        ON t.Z_PK = c.ZTRANSACTIONID
+LEFT JOIN ATRANSACTIONSTRING sb ON sb.Z_PK = t.ZBUNDLEIDTS
+LEFT JOIN ATRANSACTIONSTRING sp ON sp.Z_PK = t.ZPROCESSIDTS
+LEFT JOIN ATRANSACTIONSTRING sc ON sc.Z_PK = t.ZCONTEXTNAMETS
+WHERE c.ZCHANGETYPE = 1
+  AND a.ZTRASHEDDATE IS NOT NULL
+  AND abs(t.ZTIMESTAMP - a.ZTRASHEDDATE) < 5
+ORDER BY t.ZTIMESTAMP;
+
+
+================================================================================
+ SEZIONE 5 - SUPPORTO A RICERCHE IN ALTRE FONTI
+================================================================================
+
+-- 5.1 Estrae l'elenco degli UUID degli asset eliminati definitivamente
+--     (ZTOMBSTONE0 senza il suffisso "#PrimarySync"), con data di
+--     cestinamento ed eliminazione. L'elenco puo' essere esportato e usato
+--     come chiave di ricerca in WAL, freelist, /PhotoData/CPL/,
+--     /PhotoData/Journals/ e negli altri database dell'estrazione.
+SELECT CASE WHEN instr(c.ZTOMBSTONE0, '#') > 0
+            THEN substr(c.ZTOMBSTONE0, 1, instr(c.ZTOMBSTONE0, '#') - 1)
+            ELSE c.ZTOMBSTONE0 END                        AS uuid_asset,
+       c.ZENTITYPK                                        AS z_pk_originale,
+       datetime(c.ZTOMBSTONE3 + 978307200, 'unixepoch')   AS cestinato_utc,
+       datetime(t.ZTIMESTAMP + 978307200, 'unixepoch')    AS expunge_utc,
+       c.ZTOMBSTONE2                                      AS motivo
+FROM ACHANGE c
+JOIN Z_PRIMARYKEY pk     ON pk.Z_ENT = c.ZENTITY AND pk.Z_NAME = 'Asset'
+LEFT JOIN ATRANSACTION t ON t.Z_PK = c.ZTRANSACTIONID
+WHERE c.ZCHANGETYPE = 2
+ORDER BY t.ZTIMESTAMP;
+
+
+-- 5.2 Individua i "buchi" nella sequenza Z_PK di ZASSET, cioe' gli
+--     intervalli di chiavi non piu' presenti. Ogni buco corrisponde a
+--     record rimossi (eliminazioni definitive), anche anteriori allo storico
+--     disponibile in ACHANGE. Richiede SQLite 3.25 o successivo (funzioni
+--     finestra).
+SELECT Z_PK + 1              AS primo_z_pk_mancante,
+       prossimo - 1          AS ultimo_z_pk_mancante,
+       prossimo - Z_PK - 1   AS n_mancanti
+FROM (SELECT Z_PK, LEAD(Z_PK) OVER (ORDER BY Z_PK) AS prossimo FROM ZASSET)
+WHERE prossimo - Z_PK > 1
+ORDER BY Z_PK;
+
+
+-- 5.3 Confronta il numero di asset presenti con l'ultimo Z_PK assegnato
+--     (Z_MAX) e con le eliminazioni documentate in ACHANGE, per stimare
+--     quante eliminazioni non sono piu' coperte dallo storico.
+SELECT (SELECT Z_MAX FROM Z_PRIMARYKEY WHERE Z_NAME = 'Asset')        AS z_max_asset,
+       (SELECT count(*) FROM ZASSET)                                  AS asset_presenti,
+       (SELECT Z_MAX FROM Z_PRIMARYKEY WHERE Z_NAME = 'Asset')
+         - (SELECT count(*) FROM ZASSET)                              AS chiavi_non_presenti,
+       (SELECT count(*) FROM ACHANGE c
+          JOIN Z_PRIMARYKEY pk ON pk.Z_ENT = c.ZENTITY AND pk.Z_NAME = 'Asset'
+         WHERE c.ZCHANGETYPE = 2)                                     AS eliminazioni_in_achange;
+
+
+================================================================================
+ SEZIONE 6 - TRANSAZIONI NELL'INTERVALLO
+================================================================================
+
+-- 6.1 Riepiloga tutte le transazioni dell'intervallo per autore, bundle,
+--     processo e contesto, con il numero di modifiche per tipo. Utile per
+--     capire quali componenti hanno operato sulla libreria nel periodo di
+--     interesse.
+SELECT sa.ZNAME AS autore, sb.ZNAME AS bundle, sp.ZNAME AS processo, sc.ZNAME AS contesto,
+       count(DISTINCT t.Z_PK)                                   AS n_transazioni,
+       sum(CASE WHEN c.ZCHANGETYPE = 0 THEN 1 ELSE 0 END)       AS n_insert,
+       sum(CASE WHEN c.ZCHANGETYPE = 1 THEN 1 ELSE 0 END)       AS n_update,
+       sum(CASE WHEN c.ZCHANGETYPE = 2 THEN 1 ELSE 0 END)       AS n_delete,
+       datetime(min(t.ZTIMESTAMP) + 978307200, 'unixepoch')     AS prima_utc,
+       datetime(max(t.ZTIMESTAMP) + 978307200, 'unixepoch')     AS ultima_utc
+FROM ATRANSACTION t
+LEFT JOIN ACHANGE c             ON c.ZTRANSACTIONID = t.Z_PK
+LEFT JOIN ATRANSACTIONSTRING sa ON sa.Z_PK = t.ZAUTHORTS
+LEFT JOIN ATRANSACTIONSTRING sb ON sb.Z_PK = t.ZBUNDLEIDTS
+LEFT JOIN ATRANSACTIONSTRING sp ON sp.Z_PK = t.ZPROCESSIDTS
+LEFT JOIN ATRANSACTIONSTRING sc ON sc.Z_PK = t.ZCONTEXTNAMETS
+WHERE t.ZTIMESTAMP >= strftime('%s', '2026-05-26 00:00:00') - 978307200
+  AND t.ZTIMESTAMP <  strftime('%s', '2026-05-29 00:00:00') - 978307200
+GROUP BY 1, 2, 3, 4
+ORDER BY n_transazioni DESC;
+
+================================================================================
+ FINE
+================================================================================
